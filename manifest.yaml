@@ -3,8 +3,8 @@ kind: Plugin
 metadata:
   author: xiaowang
   name: Langbot-QQGroup-Add-One-message
-  repository: ''
-  version: 0.1.0
+  repository: 'https://github.com/1dabai/Langbot-QQGroup-Add-One-message'
+  version: 0.1.1
   description:
     en_US: 这是一个qq群聊多人发送同一个消息后触发ai自动回复一样的工具（不兼容QQ官方机器人api）
     zh_Hans: 这是一个qq群聊多人发送同一个消息后触发ai自动回复一样的工具（不兼容QQ官方机器人api）
