@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import asyncio
 from typing import Optional
 
 from langbot_plugin.api.definition.components.common.event_listener import EventListener
@@ -12,8 +13,6 @@ from langbot_plugin.api.entities.builtin.platform import message as platform_mes
 
 logger = logging.getLogger(__name__)
 
-# 消息记录保留时间（秒）
-MESSAGE_EXPIRE_TIME = 5 * 60  # 5分钟
 # 触发冷却时间（秒）
 TRIGGER_COOLDOWN_TIME = 5 * 60  # 5分钟
 
@@ -23,8 +22,8 @@ class DefaultEventListener(EventListener):
     async def initialize(self):
         await super().initialize()
 
-        # 每个群的消息记录: {group_id: [{"sender_id": str, "text": str, "timestamp": float}, ...]}
-        self._message_history: dict[str, list[dict]] = {}
+        # 每个群最近一条消息: {group_id: {"sender_id": str, "text": str, "timestamp": float}}
+        self._last_message: dict[str, dict] = {}
 
         # 每个群已触发的消息冷却记录: {group_id: {text: trigger_timestamp}}
         self._triggered_messages: dict[str, dict[str, float]] = {}
@@ -32,140 +31,99 @@ class DefaultEventListener(EventListener):
         # 机器人自己的账号ID（用于排除机器人消息）
         self._bot_id: Optional[str] = None
 
-        logger.info("=" * 50)
         logger.info("复读插件事件监听器已初始化")
-        logger.info(f"消息记录保留时间: {MESSAGE_EXPIRE_TIME}秒")
-        logger.info(f"触发冷却时间: {TRIGGER_COOLDOWN_TIME}秒")
-        logger.info("=" * 50)
 
         @self.handler(events.GroupMessageReceived)
         async def on_group_message(event_context: context.EventContext):
-            try:
-                event: events.GroupMessageReceived = event_context.event
-                group_id = str(event.launcher_id)
-                sender_id = str(event.sender_id)
+            # 立即将处理逻辑放到后台任务，不阻塞流水线
+            asyncio.create_task(self._handle_group_message(event_context))
 
-                # 获取机器人账号ID
-                if self._bot_id is None:
-                    try:
-                        bot_uuid = await event_context.get_bot_uuid()
-                        bot_info = await self.plugin.get_bot_info(bot_uuid)
-                        if "adapter_runtime_values" in bot_info and "bot_account_id" in bot_info["adapter_runtime_values"]:
-                            self._bot_id = str(bot_info["adapter_runtime_values"]["bot_account_id"])
-                            logger.info(f"机器人账号ID: {self._bot_id}")
-                    except Exception as e:
-                        logger.warning(f"获取机器人账号ID失败: {e}")
+    async def _handle_group_message(self, event_context: context.EventContext):
+        """后台处理群消息，不阻塞流水线"""
+        try:
+            event: events.GroupMessageReceived = event_context.event
+            group_id = str(event.launcher_id)
+            sender_id = str(event.sender_id)
 
-                # 排除机器人自己发送的消息
-                if self._bot_id and sender_id == self._bot_id:
-                    logger.info(f"忽略机器人自己的消息: {sender_id}")
-                    return
+            # 获取机器人账号ID（仅第一次）
+            if self._bot_id is None:
+                try:
+                    bot_uuid = await event_context.get_bot_uuid()
+                    bot_info = await self.plugin.get_bot_info(bot_uuid)
+                    if "adapter_runtime_values" in bot_info and "bot_account_id" in bot_info["adapter_runtime_values"]:
+                        self._bot_id = str(bot_info["adapter_runtime_values"]["bot_account_id"])
+                        logger.info(f"机器人账号ID: {self._bot_id}")
+                except Exception as e:
+                    logger.warning(f"获取机器人账号ID失败: {e}")
 
-                # 从消息链中提取纯文本
-                text = ""
-                if event.message_chain:
-                    for component in event.message_chain:
-                        if isinstance(component, platform_message.Plain):
-                            text += component.text
+            # 排除机器人自己发送的消息
+            if self._bot_id and sender_id == self._bot_id:
+                return
 
-                # 去除首尾空白，忽略空消息
-                text = text.strip()
-                if not text:
-                    return
+            # 从消息链中提取纯文本
+            text = ""
+            if event.message_chain:
+                for component in event.message_chain:
+                    if isinstance(component, platform_message.Plain):
+                        text += component.text
 
-                current_time = time.time()
+            # 去除首尾空白，忽略空消息
+            text = text.strip()
+            if not text:
+                return
 
-                # 清理过期的消息记录
-                self._cleanup_expired_messages(group_id, current_time)
+            current_time = time.time()
 
-                # 清理过期的触发冷却记录
-                self._cleanup_expired_triggers(group_id, current_time)
+            # 清理过期的触发冷却记录
+            self._cleanup_expired_triggers(group_id, current_time)
 
-                # 检查该消息是否在冷却期内
-                if group_id in self._triggered_messages and text in self._triggered_messages[group_id]:
-                    logger.info(f"消息 '{text}' 在冷却期内，不触发")
-                    # 更新消息记录但不触发
-                    self._add_message_to_history(group_id, sender_id, text, current_time)
-                    return
+            # 检查该消息是否在冷却期内
+            if group_id in self._triggered_messages and text in self._triggered_messages[group_id]:
+                self._last_message[group_id] = {
+                    "sender_id": sender_id,
+                    "text": text,
+                    "timestamp": current_time,
+                }
+                return
 
-                # 检查当前消息是否已有其他人发过相同内容
-                same_text_senders = set()
-                if group_id in self._message_history:
-                    for msg in self._message_history[group_id]:
-                        if msg["text"] == text and msg["sender_id"] != sender_id:
-                            same_text_senders.add(msg["sender_id"])
+            # 只和上一条消息比较（紧跟着的消息）
+            last = self._last_message.get(group_id)
 
-                logger.info(f"群: {group_id}, 发送者: {sender_id}, 消息: '{text}'")
-                logger.info(f"发送过相同内容的其他用户: {same_text_senders}")
+            if (last is not None
+                    and last["text"] == text
+                    and last["sender_id"] != sender_id):
+                # 紧跟着的上一条消息内容相同且发送者不同，触发复读
+                logger.info(f"检测到连续重复消息，复读: {text}")
 
-                # 如果已有1人或以上发过相同内容，加上当前用户就是2人及以上
-                if len(same_text_senders) >= 1:
-                    # 2人及以上发送了相同的文字，机器人复读
-                    logger.info(f"*** 检测到 {len(same_text_senders) + 1} 人发送重复消息，准备复读: {text} ***")
+                reply_chain = platform_message.MessageChain([
+                    platform_message.Plain(text=text),
+                ])
 
-                    # 构建回复消息
-                    reply_chain = platform_message.MessageChain([
-                        platform_message.Plain(text=text),
-                    ])
+                await event_context.reply(reply_chain)
 
-                    # 发送回复
-                    await event_context.reply(reply_chain)
-                    logger.info("*** 复读成功 ***")
+                # 记录触发时间，进入冷却期
+                if group_id not in self._triggered_messages:
+                    self._triggered_messages[group_id] = {}
+                self._triggered_messages[group_id][text] = current_time
 
-                    # 记录触发时间，进入冷却期
-                    if group_id not in self._triggered_messages:
-                        self._triggered_messages[group_id] = {}
-                    self._triggered_messages[group_id][text] = current_time
-                    logger.info(f"消息 '{text}' 已进入冷却期")
+                # 清除最近消息记录
+                self._last_message.pop(group_id, None)
+            else:
+                self._last_message[group_id] = {
+                    "sender_id": sender_id,
+                    "text": text,
+                    "timestamp": current_time,
+                }
 
-                    # 清除该群的消息记录
-                    self._message_history[group_id] = []
-                else:
-                    # 记录当前消息
-                    self._add_message_to_history(group_id, sender_id, text, current_time)
-
-            except Exception as e:
-                logger.error(f"处理消息时出错: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-
-    def _add_message_to_history(self, group_id: str, sender_id: str, text: str, timestamp: float):
-        """添加消息到历史记录"""
-        if group_id not in self._message_history:
-            self._message_history[group_id] = []
-        self._message_history[group_id].append({
-            "sender_id": sender_id,
-            "text": text,
-            "timestamp": timestamp,
-        })
-        logger.info(f"已记录消息: 群={group_id}, 发送者={sender_id}, 内容='{text}'")
-
-    def _cleanup_expired_messages(self, group_id: str, current_time: float):
-        """清理过期的消息记录"""
-        if group_id not in self._message_history:
-            return
-        
-        original_count = len(self._message_history[group_id])
-        self._message_history[group_id] = [
-            msg for msg in self._message_history[group_id]
-            if current_time - msg["timestamp"] < MESSAGE_EXPIRE_TIME
-        ]
-        
-        expired_count = original_count - len(self._message_history[group_id])
-        if expired_count > 0:
-            logger.info(f"清理了 {expired_count} 条过期消息记录")
+        except Exception as e:
+            logger.error(f"处理消息时出错: {e}")
 
     def _cleanup_expired_triggers(self, group_id: str, current_time: float):
         """清理过期的触发冷却记录"""
         if group_id not in self._triggered_messages:
             return
-        
-        original_count = len(self._triggered_messages[group_id])
+
         self._triggered_messages[group_id] = {
             text: ts for text, ts in self._triggered_messages[group_id].items()
             if current_time - ts < TRIGGER_COOLDOWN_TIME
         }
-        
-        expired_count = original_count - len(self._triggered_messages[group_id])
-        if expired_count > 0:
-            logger.info(f"清理了 {expired_count} 条过期触发记录")
